@@ -27,6 +27,8 @@ export class Timer {
 	cyclesSinceLastAutoStop: number;
 	activeNote: TFile;
 	whiteNoisePlayer: WhiteNoise;
+	/** Start time of the current pomodoro session across pauses */
+	pomoSessionStartTime: moment.Moment | null;
 
 	constructor(plugin: PomoTimerPlugin) {
 		this.plugin = plugin;
@@ -35,10 +37,12 @@ export class Timer {
 		this.pomosSinceStart = 0;
 		this.cyclesSinceLastAutoStop = 0;
 
-		if (this.plugin.settings.whiteNoise === true) {
-			this.whiteNoisePlayer = new WhiteNoise(plugin, whiteNoiseUrl);
+			if (this.plugin.settings.whiteNoise === true) {
+				this.whiteNoisePlayer = new WhiteNoise(plugin, whiteNoiseUrl);
+			}
+
+			this.pomoSessionStartTime = null;
 		}
-	}
 
 	onRibbonIconClick() {
 		if (this.mode === Mode.NoTimer) {  //if starting from not having a timer running/paused
@@ -195,6 +199,10 @@ export class Timer {
 			this.mode = mode;
 		}
 
+		// When entering a new Pomodoro session, record the session start time
+		if (this.mode === Mode.Pomo) {
+			this.pomoSessionStartTime = moment();
+		}
 		this.setStartAndEndTime(this.getTotalModeMillisecs());
 	}
 
@@ -277,9 +285,14 @@ export class Timer {
 
 
 	/**************  Logging  **************/
-	private buildLogText(prefix: string = ""): string {
+	private buildLogText(prefix: string = "", durationMs?: number): string {
 		let timestamp = moment().format(this.plugin.settings.logText);
 		let logText = prefix ? `${prefix} ${timestamp}` : timestamp;
+
+		// Append duration before the note link when provided
+		if (typeof durationMs === 'number' && !isNaN(durationMs) && durationMs >= 0) {
+			logText = `${logText} — ${millisecsToString(durationMs)}`;
+		}
 
 		// Always place the active note link at the end when enabled
 		if (this.plugin.settings.logActiveNote === true && this.activeNote) {
@@ -308,8 +321,10 @@ export class Timer {
 	}
 
 	async logPomo(): Promise<void> {
-		const logText = this.buildLogText("[🍅]");
+		let durationMs = this.pomoSessionStartTime ? moment().diff(this.pomoSessionStartTime) : (this.plugin.settings.pomo * MILLISECS_IN_MINUTE);
+		const logText = this.buildLogText("[🍅]", durationMs);
 		await this.writeLogEntry(logText);
+		this.pomoSessionStartTime = null;
 	}
 
 	async logPomoStart(): Promise<void> {
@@ -318,8 +333,11 @@ export class Timer {
 	}
 
 	async logPomoQuitEarly(): Promise<void> {
-		const logText = this.buildLogText("[🍅 Quit Early]");
+		let baseStart = this.pomoSessionStartTime || this.startTime;
+		let durationMs = baseStart ? moment().diff(baseStart) : undefined;
+		const logText = this.buildLogText("[🍅 Quit Early]", durationMs);
 		await this.writeLogEntry(logText);
+		this.pomoSessionStartTime = null;
 	}
 
 	//from Note Refactor plugin by James Lynch, https://github.com/lynchjames/note-refactor-obsidian/blob/80c1a23a1352b5d22c70f1b1d915b4e0a1b2b33f/src/obsidian-file.ts#L69
@@ -391,9 +409,6 @@ function showSystemNotification(mode:Mode, useEmoji:boolean): void {
 	});
 	n.show();
 }
-
-
-
 
 
 
