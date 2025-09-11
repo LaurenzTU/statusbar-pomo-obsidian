@@ -103,6 +103,17 @@ export class Timer {
 	}
 
 	async quitTimer(): Promise<void> {
+		// If quitting a running pomodoro early, note it in the log
+		if (this.plugin.settings.logging === true && this.mode === Mode.Pomo) {
+			try {
+				if (!this.endTime || moment().isBefore(this.endTime)) {
+					await this.logPomoQuitEarly();
+				}
+			} catch (e) {
+				console.log(e);
+			}
+		}
+
 		this.mode = Mode.NoTimer;
 		this.startTime = moment(0);
 		this.endTime = moment(0);
@@ -153,8 +164,13 @@ export class Timer {
 		this.setupTimer(mode);
 		this.paused = false; //do I need this?
 
-		if (this.plugin.settings.logActiveNote === true) {
-			this.setLogFile()
+
+		// Capture the active note at start so it can be logged later
+		this.setLogFile();
+
+		// Log immediately when a pomodoro starts
+		if (this.plugin.settings.logging === true && this.mode === Mode.Pomo) {
+			this.logPomoStart();
 		}
 
 		this.modeStartingNotification();
@@ -261,21 +277,21 @@ export class Timer {
 
 
 	/**************  Logging  **************/
-	async logPomo(): Promise<void> {
-		var logText = moment().format(this.plugin.settings.logText);
-		const logFilePlaceholder = "{{logFile}}";
+	private buildLogText(prefix: string = ""): string {
+		let timestamp = moment().format(this.plugin.settings.logText);
+		let logText = prefix ? `${prefix} ${timestamp}` : timestamp;
 
-		if (this.plugin.settings.logActiveNote === true) {
-			let linkText = this.plugin.app.fileManager.generateMarkdownLink(this.activeNote, '');
-			if (logText.includes(logFilePlaceholder)) {
-				logText = logText.replace(logFilePlaceholder, linkText);
-			} else {
-				logText = logText + " " + linkText;
-			}
-
+		// Always place the active note link at the end when enabled
+		if (this.plugin.settings.logActiveNote === true && this.activeNote) {
+			const linkText = this.plugin.app.fileManager.generateMarkdownLink(this.activeNote, '');
+			logText = `${logText} ${linkText}`;
 			logText = logText.replace(String.raw`\n`, "\n");
 		}
 
+		return logText;
+	}
+
+	private async writeLogEntry(logText: string): Promise<void> {
 		if (this.plugin.settings.logToDaily === true) { //use today's note
 			let file = (await this.plugin.getDailyNoteFile()).path;
 			await this.appendFile(file, logText);
@@ -289,6 +305,21 @@ export class Timer {
 
 			await this.appendFile(this.plugin.settings.logFile, logText);
 		}
+	}
+
+	async logPomo(): Promise<void> {
+		const logText = this.buildLogText("[🍅]");
+		await this.writeLogEntry(logText);
+	}
+
+	async logPomoStart(): Promise<void> {
+		const logText = this.buildLogText("[🍅 Start]");
+		await this.writeLogEntry(logText);
+	}
+
+	async logPomoQuitEarly(): Promise<void> {
+		const logText = this.buildLogText("[🍅 Quit Early]");
+		await this.writeLogEntry(logText);
 	}
 
 	//from Note Refactor plugin by James Lynch, https://github.com/lynchjames/note-refactor-obsidian/blob/80c1a23a1352b5d22c70f1b1d915b4e0a1b2b33f/src/obsidian-file.ts#L69
@@ -360,8 +391,6 @@ function showSystemNotification(mode:Mode, useEmoji:boolean): void {
 	});
 	n.show();
 }
-
-
 
 
 
