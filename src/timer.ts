@@ -29,6 +29,8 @@ export class Timer {
 	whiteNoisePlayer: WhiteNoise;
 	/** Start time of the current pomodoro session across pauses */
 	pomoSessionStartTime: moment.Moment | null;
+	/** Start time of the current break session across pauses */
+	breakSessionStartTime: moment.Moment | null;
 
 	constructor(plugin: PomoTimerPlugin) {
 		this.plugin = plugin;
@@ -42,6 +44,7 @@ export class Timer {
 			}
 
 			this.pomoSessionStartTime = null;
+			this.breakSessionStartTime = null;
 		}
 
 	onRibbonIconClick() {
@@ -82,9 +85,15 @@ export class Timer {
 
 			if (this.plugin.settings.logging === true) {
 				await this.logPomo();
+				await this.updateDailySummary();
 			}
 		} else if (this.mode === Mode.ShortBreak || this.mode === Mode.LongBreak) {
 			this.cyclesSinceLastAutoStop += 1;
+
+			if (this.plugin.settings.logging === true) {
+				await this.logBreak();
+				await this.updateDailySummary();
+			}
 		}
 
 		//switch mode
@@ -112,6 +121,7 @@ export class Timer {
 			try {
 				if (!this.endTime || moment().isBefore(this.endTime)) {
 					await this.logPomoQuitEarly();
+					await this.updateDailySummary();
 				}
 			} catch (e) {
 				console.log(e);
@@ -140,16 +150,21 @@ export class Timer {
 		}
 	}
 
-	togglePause() {
+	async togglePause() {
 		if (this.paused === true) {
 			this.restartTimer();
 		} else if (this.mode !== Mode.NoTimer) { //if some timer running
 			this.pauseTimer();
 			new Notice("Timer paused.")
 		}
+
+		// Update summary on any state change
+		if (this.plugin.settings.logging === true) {
+			await this.updateDailySummary();
+		}
 	}
 
-	restartTimer(): void {
+		restartTimer(): void {
 		if (this.plugin.settings.logActiveNote === true && this.autoPaused === true) {
 			this.setLogFile();
 			this.autoPaused = false;
@@ -172,9 +187,14 @@ export class Timer {
 		// Capture the active note at start so it can be logged later
 		this.setLogFile();
 
-		// Log immediately when a pomodoro starts
-		if (this.plugin.settings.logging === true && this.mode === Mode.Pomo) {
-			this.logPomoStart();
+		// Log immediately when a session starts
+		if (this.plugin.settings.logging === true) {
+			if (this.mode === Mode.Pomo) {
+				this.logPomoStart();
+			} else if (this.mode === Mode.ShortBreak || this.mode === Mode.LongBreak) {
+				this.logBreakStart();
+			}
+			this.updateDailySummary();
 		}
 
 		this.modeStartingNotification();
@@ -199,9 +219,13 @@ export class Timer {
 			this.mode = mode;
 		}
 
-		// When entering a new Pomodoro session, record the session start time
+		// When entering a new session, record the session start time
 		if (this.mode === Mode.Pomo) {
 			this.pomoSessionStartTime = moment();
+			this.breakSessionStartTime = null;
+		} else if (this.mode === Mode.ShortBreak || this.mode === Mode.LongBreak) {
+			this.breakSessionStartTime = moment();
+			this.pomoSessionStartTime = null;
 		}
 		this.setStartAndEndTime(this.getTotalModeMillisecs());
 	}
@@ -286,7 +310,8 @@ export class Timer {
 
 	/**************  Logging  **************/
 	private buildLogText(prefix: string = "", durationMs?: number): string {
-		let timestamp = moment().format(this.plugin.settings.logText);
+		// Always log only the time of day (no date)
+		let timestamp = moment().format('HH:mm');
 		let logText = prefix ? `${prefix} ${timestamp}` : timestamp;
 
 		// Append duration before the note link when provided
@@ -305,19 +330,8 @@ export class Timer {
 	}
 
 	private async writeLogEntry(logText: string): Promise<void> {
-		if (this.plugin.settings.logToDaily === true) { //use today's note
-			let file = (await this.plugin.getDailyNoteFile()).path;
-			await this.appendFile(file, logText);
-		} else { //use file given in settings
-			let file = this.plugin.app.vault.getAbstractFileByPath(this.plugin.settings.logFile);
-
-			if (!file || file !instanceof TFolder) { //if no file, create
-				console.log("Creating pomodoro log file");
-				await this.plugin.app.vault.create(this.plugin.settings.logFile, "");
-			}
-
-			await this.appendFile(this.plugin.settings.logFile, logText);
-		}
+		const filePath = await this.getOrCreateLogFilePath();
+		await this.insertUnderDailyHeading(filePath, logText);
 	}
 
 	async logPomo(): Promise<void> {
@@ -340,6 +354,18 @@ export class Timer {
 		this.pomoSessionStartTime = null;
 	}
 
+	async logBreakStart(): Promise<void> {
+		const logText = this.buildLogText("[🏖 Start]");
+		await this.writeLogEntry(logText);
+	}
+
+	async logBreak(): Promise<void> {
+		let durationMs = this.breakSessionStartTime ? moment().diff(this.breakSessionStartTime) : undefined;
+		const logText = this.buildLogText("[🏖]", durationMs);
+		await this.writeLogEntry(logText);
+		this.breakSessionStartTime = null;
+	}
+
 	//from Note Refactor plugin by James Lynch, https://github.com/lynchjames/note-refactor-obsidian/blob/80c1a23a1352b5d22c70f1b1d915b4e0a1b2b33f/src/obsidian-file.ts#L69
 	async appendFile(filePath: string, logText: string): Promise<void> {
 		let existingContent = await this.plugin.app.vault.adapter.read(filePath);
@@ -349,11 +375,147 @@ export class Timer {
 		await this.plugin.app.vault.adapter.write(filePath, existingContent + logText);
 	}
 
+	private async getOrCreateLogFilePath(): Promise<string> {
+		if (this.plugin.settings.logToDaily === true) {
+			return (await this.plugin.getDailyNoteFile()).path;
+		}
+
+		let file = this.plugin.app.vault.getAbstractFileByPath(this.plugin.settings.logFile);
+		if (!file || file !instanceof TFolder) { // if no file, create
+			console.log("Creating pomodoro log file");
+			await this.plugin.app.vault.create(this.plugin.settings.logFile, "");
+		}
+		return this.plugin.settings.logFile;
+	}
+
+	private getTodayHeadingPrefix(): string {
+		// One heading per day, include weekday name, totals appended later
+		const todayStr = moment().format('YYYY-MM-DD (dddd)');
+		return `## ${todayStr}`;
+	}
+
+	private buildHeadingWithTotals(pomoMs: number, breakMs: number): string {
+		const totalMs = pomoMs + breakMs;
+		return `${this.getTodayHeadingPrefix()} — 🍅 ${this.formatTotal(pomoMs)}, 🏖 ${this.formatTotal(breakMs)}, Σ ${this.formatTotal(totalMs)}`;
+	}
+
+	private findSectionBounds(lines: string[], headingPrefix: string): { start: number, end: number } | null {
+		let start = -1;
+		for (let i = 0; i < lines.length; i++) {
+			if (lines[i].startsWith(headingPrefix)) {
+				start = i;
+				break;
+			}
+		}
+		if (start === -1) return null;
+		let end = lines.length;
+		for (let i = start + 1; i < lines.length; i++) {
+			if (lines[i].startsWith('## ') || lines[i].startsWith('# ')) {
+				end = i;
+				break;
+			}
+		}
+		return { start, end };
+	}
+
+	private async insertUnderDailyHeading(filePath: string, logText: string): Promise<void> {
+		let content = await this.plugin.app.vault.adapter.read(filePath);
+		const headingPrefix = this.getTodayHeadingPrefix();
+		let lines = content.split(/\r?\n/);
+
+		let section = this.findSectionBounds(lines, headingPrefix);
+		if (!section) {
+			// Create new heading at end
+			const pomoMs = 0;
+			const breakMs = 0;
+			const headingLine = this.buildHeadingWithTotals(pomoMs, breakMs);
+			if (content.length > 0 && !content.endsWith('\n')) content += '\n';
+			content += headingLine + '\n';
+			content += logText;
+			await this.plugin.app.vault.adapter.write(filePath, content);
+			return;
+		}
+
+		// Insert logText at the end of the section
+		const insertIndex = section.end; // before next heading or at EOF
+		const needsNewlineBefore = insertIndex > 0 && lines[insertIndex - 1].length > 0;
+		if (needsNewlineBefore) {
+			lines.splice(insertIndex, 0, '');
+			section.end++;
+		}
+		lines.splice(section.end, 0, logText);
+
+		await this.plugin.app.vault.adapter.write(filePath, lines.join('\n'));
+	}
+
 	setLogFile(){
 		const activeView = this.plugin.app.workspace.getActiveFile();
 		if (activeView) {
 			this.activeNote = activeView;
 		}
+	}
+
+	/**************  Daily Summary (daily notes) **************/
+	private parseDurationToMillis(duration: string): number {
+		// duration formats: HH:mm:ss or mm:ss
+		const parts = duration.split(":").map(p => Number(p));
+		if (parts.length === 3) {
+			return ((parts[0] * 60 * 60) + (parts[1] * 60) + parts[2]) * 1000;
+		} else if (parts.length === 2) {
+			return ((parts[0] * 60) + parts[1]) * 1000;
+		}
+		return 0;
+	}
+
+	private sumDurations(content: string, type: 'pomo' | 'break'): number {
+		const lines = content.split(/\r?\n/);
+		let sum = 0;
+		for (const line of lines) {
+			const trimmed = line.trim();
+			let isMatch = false;
+			if (type === 'pomo') {
+				// Include completed pomos and quit-early pomos, exclude starts
+				isMatch = (trimmed.startsWith('[🍅]') || trimmed.startsWith('[🍅 Quit Early]')) && !trimmed.includes('Start');
+			} else {
+				// Include completed breaks, exclude starts
+				isMatch = trimmed.startsWith('[🏖]') && !trimmed.includes('Start');
+			}
+			if (!isMatch) continue;
+
+			const m = trimmed.match(/—\s+([0-9]{1,2}:\d{2}(?::\d{2})?)/);
+			if (m && m[1]) {
+				sum += this.parseDurationToMillis(m[1]);
+			}
+		}
+		return sum;
+	}
+
+	private formatTotal(ms: number): string {
+		return millisecsToString(ms);
+	}
+
+	private async updateDailySummary(): Promise<void> {
+		if (this.plugin.settings.logging !== true) return;
+
+		const filePath = await this.getOrCreateLogFilePath();
+		let content = await this.plugin.app.vault.adapter.read(filePath);
+		let lines = content.split(/\r?\n/);
+
+		const headingPrefix = this.getTodayHeadingPrefix();
+		let section = this.findSectionBounds(lines, headingPrefix);
+		if (!section) {
+			// Nothing to update if today's heading doesn't exist yet
+			return;
+		}
+
+		// Compute totals within the section (excluding the heading line)
+		const sectionLines = lines.slice(section.start + 1, section.end);
+		const sectionContent = sectionLines.join('\n');
+		const pomoMs = this.sumDurations(sectionContent, 'pomo');
+		const breakMs = this.sumDurations(sectionContent, 'break');
+
+		lines[section.start] = this.buildHeadingWithTotals(pomoMs, breakMs);
+		await this.plugin.app.vault.adapter.write(filePath, lines.join('\n'));
 	}
 }
 
@@ -409,6 +571,3 @@ function showSystemNotification(mode:Mode, useEmoji:boolean): void {
 	});
 	n.show();
 }
-
-
-
